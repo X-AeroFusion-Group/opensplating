@@ -1,293 +1,317 @@
-# opensplating
-# 💦 OpenSplat
+# OpenSplatting Technical Report: From COLMAP Sparse Reconstruction to OpenSplat Training
 
-A free and open source implementation of 3D [gaussian splatting](https://www.youtube.com/watch?v=HVv_IQKlafQ) written in C++, focused on being portable, lean and fast.
+This document summarizes the project workflow ([opensplatting](https://github.com/XitingChen-Chloe/opensplatting)–related notes) and covers the end-to-end pipeline on **WSL2**: **COLMAP → (optional) undistortion / image compression → OpenSplat (Docker + CUDA)**.
 
-<img src="https://github.com/pierotofy/OpenSplat/assets/1951843/c9327c7c-31ad-402d-a5a5-04f7602ca5f5" width="49%" />
-<img src="https://github.com/pierotofy/OpenSplat/assets/1951843/eba4ae75-2c88-4c9e-a66b-608b574d085f" width="49%" />
+---
 
-OpenSplat takes camera poses + sparse points in [COLMAP](https://colmap.github.io/), [OpenSfM](https://github.com/mapillary/OpenSfM), [ODM](https://github.com/OpenDroneMap/ODM),  [OpenMVG](https://github.com/OpenMVG/OpenMVG) or [nerfstudio](https://docs.nerf.studio/quickstart/custom_dataset.html) project format and computes a [scene file](https://drive.google.com/file/d/12lmvVWpFlFPL6nxl2e2d-4u4a31RCSKT/view?usp=sharing) (.ply or .splat) that can be later imported for [viewing](https://antimatter15.com/splat/?url=https://splat.uav4geo.com/banana.splat), editing and rendering in other [software](https://github.com/MrNeRF/awesome-3D-gaussian-splatting?tab=readme-ov-file#open-source-implementations).
+## 1. Abstract
 
-Graphics card recommended, but not required! OpenSplat runs the fastest on NVIDIA, AMD and Apple (Metal) GPUs, but can also run entirely on the CPU (~100x slower).
+In a **WSL2** environment, **COLMAP** recovers camera poses and sparse 3D points from RGB images; **OpenSplat** then trains a **3D Gaussian Splatting** model, producing `splat.ply` and `cameras.json`. This report covers: sparse reconstruction, model validation, (optional) undistortion for PINHOLE compatibility, (optional) image compression, Docker image build and training, and common troubleshooting.
 
-Commercial use allowed and encouraged under the terms of the [AGPLv3](https://www.tldrlegal.com/license/gnu-affero-general-public-license-v3-agpl-3-0). ✅
+---
 
-We even have a [song](https://youtu.be/1bma7XJkoDM) 🎵
+## 2. Goals and I/O
 
-## Getting Started
+| Stage | Input | Output |
+|------|------|------|
+| COLMAP | `images/`, (optional) new `database.db` | `database.db`, `sparse/0/` (or `1/`, …) |
+| Undistortion (if needed) | `images/` + `sparse/0/` | `dense/images/`, `dense/sparse/`, or packaged `opensplat_input/` |
+| OpenSplat | `images/` + `sparse/<model>/` | `splat.ply`, `cameras.json`, optional intermediate `splat_<steps>.ply` |
 
-If you're on Windows, you can [buy](http://sites.fastspring.com/masseranolabs/product/opensplatforwindows) the pre-built program. This saves you time and helps support the project ❤️. Then jump directly to the [run](#run) section. As an alternative, check the [build](#build) section below.
+**Note:** OpenSplat requires a **sparse model and images consistent with it**. Dense MVS is **not** a hard prerequisite for OpenSplat.
 
-If you're on macOS or Linux check the [build](#build) section below. 
+---
 
-## Build
+## 3. Environment and Toolchain
 
-You can build OpenSplat with or without GPU support.
+- **WSL2:** For large datasets, prefer an ext4 home directory to reduce cross-filesystem I/O.
+- **COLMAP:** `colmap --version`; use CPU paths (`use_gpu 0`) when CUDA is unavailable.
+- **Docker:** `docker version` works; GPU requires `docker run --gpus all` and a working NVIDIA driver on the host.
+- **OpenSplat:** Typically build locally with `docker build` (e.g. `opensplat:latest`); binary inside the container: `/code/build/opensplat`.
 
-Requirements for all builds:
+---
 
- * **OpenCV**: `sudo apt install libopencv-dev` should do it.
- * **libtorch**: See instructions below.
+## 4. Standard Directory Layout (COLMAP Project)
 
-### CPU
-
-For libtorch visit https://pytorch.org/get-started/locally/ and select your OS, for package select "LibTorch". For compute platform you can select "CPU".
-
- Then:
-
- ```bash
- git clone https://github.com/pierotofy/OpenSplat OpenSplat
- cd OpenSplat
- mkdir build && cd build
- cmake -DCMAKE_PREFIX_PATH=/path/to/libtorch/ .. && make -j$(nproc)
- ```
-
-### CUDA
-
-Additional requirement:
-
- * **CUDA**: Make sure you have the CUDA compiler (`nvcc`) in your PATH and that `nvidia-smi` is working. https://docs.nvidia.com/cuda/cuda-installation-guide-linux/index.html 
- 
- For libtorch visit https://pytorch.org/get-started/locally/ and select your OS, for package select "LibTorch". Make sure to match your version of CUDA if you want to leverage GPU support in libtorch.
- 
- Then:
-
- ```bash
- git clone https://github.com/pierotofy/OpenSplat OpenSplat
- cd OpenSplat
- mkdir build && cd build
- cmake -DCMAKE_PREFIX_PATH=/path/to/libtorch/ .. && make -j$(nproc)
- ```
-
-### ROCm via HIP
-
-Additional requirement:
-
-* **ROCm**: Make sure you have the ROCm installed at /opt/rocm. https://rocm.docs.amd.com/projects/install-on-linux/en/latest/tutorial/quick-start.html
-
-For libtorch visit https://pytorch.org/get-started/locally/ and select your OS, for package select "LibTorch". Make sure to match your version of ROCm (5.7) if you want to leverage AMD GPU support in libtorch.
-
-Then:
-
- ```bash
- git clone https://github.com/pierotofy/OpenSplat OpenSplat
- cd OpenSplat
- mkdir build && cd build
- export PYTORCH_ROCM_ARCH=gfx906
- cmake -DCMAKE_PREFIX_PATH=/path/to/libtorch/ -DGPU_RUNTIME="HIP" -DHIP_ROOT_DIR=/opt/rocm -DOPENSPLAT_BUILD_SIMPLE_TRAINER=ON ..
- make
- ```
-
-In addition, you can leverage Jinja to build the project
-
-```bash
-cmake -GNinja -DCMAKE_PREFIX_PATH=/path/to/libtorch/ -DGPU_RUNTIME="HIP" -DHIP_ROOT_DIR=/opt/rocm -DOPENSPLAT_BUILD_SIMPLE_TRAINER=ON ..
-jinja
+```text
+colmap_ws/
+├── images/           # RGB images; filenames must match DB / model
+├── database.db       # Features, matches, metadata
+└── sparse/           # mapper output
+    └── 0/            # primary model (or 1, 2, …)
 ```
 
-### Windows
+If `database.db` does not exist yet, run feature extraction first. If you copy an existing database that already contains matches, you may skip extraction and go straight to matching or reconstruction, depending on the data.
 
-There's several ways to build on Windows, but this particular configuration has been confirmed to work:
+---
 
-* Visual Studio 2022 C++
-* https://github.com/Kitware/CMake/releases/download/v3.28.3/cmake-3.28.3-windows-x86_64.msi
-* https://developer.download.nvidia.com/compute/cuda/11.8.0/network_installers/cuda_11.8.0_windows_network.exe
-* https://download.pytorch.org/libtorch/cu118/libtorch-win-shared-with-deps-2.1.2%2Bcu118.zip
-* https://github.com/opencv/opencv/releases/download/4.9.0/opencv-4.9.0-windows.exe
+## 5. Pipeline A: COLMAP Sparse Reconstruction
 
-Then run:
+### 5.1 Feature Extraction
 
-```console
-"C:/Program Files/Microsoft Visual Studio/2022/Community/VC/Auxiliary/Build/vcvars64.bat"
-git clone https://github.com/pierotofy/OpenSplat OpenSplat
+```bash
+cd /path/to/colmap_ws
+env -u DISPLAY QT_QPA_PLATFORM=offscreen colmap feature_extractor \
+  --database_path database.db \
+  --image_path images
+```
+
+For CPU-only COLMAP, add: `--SiftExtraction.use_gpu 0` (confirm with `colmap feature_extractor -h`).
+
+### 5.2 Feature Matching
+
+| Data type | Recommendation |
+|-----------|----------------|
+| Video / ordered sequence | `sequential_matcher` |
+| Unordered / orbit | `exhaustive_matcher` or `vocab_tree_matcher` |
+
+**Sequential matching example (headless WSL + CPU matching):**
+
+```bash
+env -u DISPLAY QT_QPA_PLATFORM=offscreen colmap sequential_matcher \
+  --database_path database.db \
+  --SequentialMatching.overlap 30 \
+  --SequentialMatching.quadratic_overlap 1 \
+  --SiftMatching.use_gpu 0
+```
+
+- `env -u DISPLAY`: avoids Qt errors from an invalid `DISPLAY`.
+- `QT_QPA_PLATFORM=offscreen`: runs without a window.
+- Matches are stored in **`database.db`**; there is no separate `matches/` folder.
+
+### 5.3 Incremental Reconstruction (`mapper`)
+
+```bash
+mkdir -p sparse
+env -u DISPLAY QT_QPA_PLATFORM=offscreen colmap mapper \
+  --database_path database.db \
+  --image_path images \
+  --output_path sparse \
+  --Mapper.num_threads 4 \
+  --Mapper.ba_global_images_freq 1000 \
+  --Mapper.ba_global_points_freq 500000 \
+  --Mapper.abs_pose_max_error 20 \
+  --Mapper.abs_pose_min_inlier_ratio 0.15 \
+  --Mapper.max_reg_trials 6
+```
+
+**Important:** Do **not** pass `--SiftMatching.*` to `mapper` (those flags apply only to `feature_extractor` / `*_matcher`).
+
+**Very long sequences:** try `hierarchical_mapper` (see `colmap hierarchical_mapper -h`).
+
+**Resume from an existing model** (only when you intentionally continue incremental registration):
+
+```bash
+colmap mapper \
+  --database_path database.db \
+  --image_path images \
+  --input_path sparse/0 \
+  --output_path sparse
+```
+
+If the previous run crashed or geometry is poor, back up and clear `sparse`, then rerun **without** `--input_path`.
+
+### 5.4 Quality Check
+
+```bash
+colmap model_analyzer --path sparse/0
+```
+
+Check whether **Registered images** is close to the total image count and whether reprojection error is reasonable. For multiple models (`sparse/0`, `sparse/1`, …), inspect each; **pick the model with the most registered images** as the primary one.
+
+---
+
+## 6. Pre–OpenSplat Checklist
+
+1. `images/` matches the images used for reconstruction.
+2. Use a `sparse/<id>/` with enough registered views.
+3. If downstream tools only accept `sparse/0/`, copy or symlink the primary model to `sparse/0/` (back up first).
+4. If OpenSplat reports an **unsupported camera model** (e.g. **FULL_OPENCV** in the sparse model), run undistortion first to obtain **PINHOLE / SIMPLE_PINHOLE** and undistorted images (next section).
+
+---
+
+## 7. Pipeline B: Undistortion → PINHOLE (`image_undistorter`)
+
+**Purpose:** Given `images/` and `sparse/0/`, run `image_undistorter` to typically produce:
+
+- `dense/images/`: undistorted images
+- `dense/sparse/`: matching sparse model (cameras usually PINHOLE family)
+
+If your project includes a one-shot script (e.g. `colmap_undistort_to_pinhole.sh`), typical usage:
+
+```bash
+cd /home/ccxx/colmap_ws
+chmod +x colmap_undistort_to_pinhole.sh
+./colmap_undistort_to_pinhole.sh
+```
+
+- By default the script may delete and recreate `dense/` and emit `opensplat_input/` (`images/` + `sparse/0/`) for packaging.
+- Dense only, no package: `PACK=0 ./colmap_undistort_to_pinhole.sh`
+- Custom paths: pass `BASE`, `IMAGE_SUB`, `Sparse_SUB`, `DENSE_SUB`, etc. as environment variables.
+
+**Rule:** For OpenSplat training, **undistorted images** must be paired with the **undistorted sparse** model; **do not** mix them with original distorted images.
+
+---
+
+## 8. Pipeline C: Image Compression (Upload / Size Limits)
+
+When compressing images **without** changing `sparse` geometry files, you must keep:
+
+- **Filenames (including extension) unchanged**
+- **Resolution (width × height) unchanged**
+
+Otherwise projection and training will be misaligned.
+
+### 8.1 Which Folder to Compress?
+
+| Stage | Recommendation |
+|-------|----------------|
+| After undistortion, ready for OpenSplat | Compress `dense/images/` or `opensplat_input/images/` together with the matching `sparse` |
+| COLMAP only, not undistorted | Compressing `images/` must match the current `sparse` reconstruction; safest to finalize `sparse` before compressing images |
+
+### 8.2 Option 1: `compress_images.py` (Pillow)
+
+After setting `BASE`, `SRC`, `DST` in the script:
+
+```bash
+pip3 install --user pillow
+python3 /path/to/colmap_ws/compress_images.py
+```
+
+JPEG: adjust quality; PNG: often lossless optimization with limited size reduction.
+
+### 8.3 Option 2: `pngquant_images.sh` (lossy PNG)
+
+Install: `sudo apt install -y pngquant`.  
+Use `BASE`, `SRC_NAME`, `DST_NAME`, `COLORS`, etc. to select folders and palette size.
+
+### 8.4 If Still Too Large
+
+- Lower `COLORS` or JPEG quality slightly.
+- **Frame dropping** requires **re-running COLMAP**; you cannot delete images and keep the old model.
+- Request a larger upload quota or split archives.
+
+If present in the repo, see `WSL_图像压缩说明.md` for more detail.
+
+---
+
+## 9. Pipeline D: OpenSplat (WSL2 + Docker)
+
+### 9.1 Build the Image
+
+```bash
+cd ~
+git clone https://github.com/pierotofy/OpenSplat.git
 cd OpenSplat
-md build
-cd build
-cmake -DCMAKE_PREFIX_PATH=C:/path_to/libtorch_2.1.2_cu11.8/libtorch -DOPENCV_DIR=C:/path_to/OpenCV_4.9.0/build -DCMAKE_BUILD_TYPE=Release ..
-cmake --build . --config Release
+docker build -t opensplat:latest .
 ```
 
-Optional: Edit cuda target (only if required) before `cmake --build .`
-
-C:/path_to/OpenSplat/build/gsplat.vcxproj
-for example: arch=compute_75,code=sm_75
-
-### macOS
-
-If you're using [Homebrew](https://brew.sh), you can install Cmake/OpenCV/Pytorch by running:
+If build fails on newer GPUs, specify CUDA architectures, e.g.:
 
 ```bash
-brew install cmake
-brew install opencv
-brew install pytorch
+docker build -t opensplat:latest \
+  --build-arg CMAKE_CUDA_ARCHITECTURES="75;80;86;89" \
+  .
 ```
 
-You will also need to install Xcode and the Xcode command line tools to compile with metal support (otherwise, OpenSplat will build with CPU acceleration only):
-1. Install Xcode from the Apple App Store.
-2. Install the command line tools with `xcode-select --install`. This might do nothing on your machine.
-3. If `xcode-select --print-path` prints `/Library/Developer/CommandLineTools`,then run `sudo xcode-select --switch /Applications/Xcode.app/Contents/Developer`.
+### 9.2 Mount Paths
 
-Then run:
+- WSL example: `/home/ccxx/colmap_ws/opensplat_input`
+- Windows drive: `D:\colmap` → `/mnt/d/colmap`
 
-```
-git clone https://github.com/pierotofy/OpenSplat OpenSplat
-cd OpenSplat
-mkdir build && cd build
-cmake -DCMAKE_PREFIX_PATH=/path/to/libtorch/ -DGPU_RUNTIME=MPS .. && make -j$(sysctl -n hw.logicalcpu)
-./opensplat
-```
+For long training runs, prefer WSL ext4 storage.
 
-If building CPU-only, remove `-DGPU_RUNTIME=MPS`.
+### 9.3 Run Training (Example)
 
-:warning: You will probably get a *libc10.dylib can’t be opened because Apple cannot check it for malicious software* error on first run. Open **System Settings** and go to **Privacy & Security** and find the **Allow** button. You might need to repeat this several times until all torch libraries are loaded.
-
-:warning: If you get a *Library not loaded: @rpath/libomp.dylib* error, try running `brew link libomp --force` before running OpenSplat.
-
-## Docker Build
-
-### CUDA
-
-Navigate to the root directory of OpenSplat repo that has Dockerfile and run the following command to build the Docker image:
+Replace the username/path with your actual WSL user:
 
 ```bash
-docker build -t opensplat .
+docker run --gpus all --rm -it \
+  -v /home/ccxx/colmap_ws/opensplat_input:/data/scene \
+  opensplat:latest \
+  bash -lc 'cd /code/build && ./opensplat /data/scene \
+    -n 20000 \
+    -d 2 \
+    --densify-grad-thresh 0.0004 \
+    --refine-every 100 \
+    --warmup-length 700 \
+    --reset-alpha-every 28 \
+    --stop-screen-size-at 2500 \
+    --split-screen-size 0.04 \
+    --ssim-weight 0.15 \
+    --save-every 2000 \
+    --val \
+    --val-render /data/scene/val_d2_v2 \
+    -o /data/scene/splat_20000_d2_v2.ply'
 ```
 
-The `-t` flag and other `--build-arg` let you tag and further customize your image across different ubuntu versions, CUDA/libtorch stacks, and hardware accelerators. 
-For example, to build an image with Ubuntu 22.04, CUDA 12.1.1, libtorch 2.2.1, and support for CUDA architectures 7.0 and 7.5, run the following command:
+Outputs typically include: `splat_*.ply`, `cameras.json`; with `--save-every`, intermediate `splat_<step>.ply` files.
+
+To use a custom image subdirectory (not default `images/`), use `--colmap-image-path` per your OpenSplat version’s `./opensplat --help`.
+
+### 9.4 Help
 
 ```bash
-docker build \
-  -t opensplat:ubuntu-22.04-cuda-12.1.1-torch-2.2.1 \
-  --build-arg UBUNTU_VERSION=22.04 \
-  --build-arg CUDA_VERSION=12.1.1 \
-  --build-arg TORCH_VERSION=2.2.1 \
-  --build-arg CMAKE_CUDA_ARCHITECTURES="70;75;80" \
-  --build-arg CMAKE_BUILD_TYPE=Release .
+docker run --rm opensplat:latest bash -lc 'cd /code/build && ./opensplat --help'
 ```
 
-### ROCm via HIP
+Common flags: `-n` iterations, `-d` downscale, `--densify-grad-thresh` densification strength, `--resume` continue from a PLY, etc.
 
-Navigate to the root directory of OpenSplat repo that has Dockerfile and run the following command to build the Docker image:
-```bash
-docker build \
-  -t opensplat \
-  -f Dockerfile.rocm .
-```
+### 9.5 Tuning (Reduce Floaters / Large Halos, Optional)
 
-The `-t` flag and other `--build-arg` let you tag and further customize your image across different ubuntu versions, CUDA/libtorch stacks, and hardware accelerators.
-For example, to build an image with Ubuntu 22.04, CUDA 12.1.1, libtorch 2.2.1, ROCm 5.7.1, and support for ROCm architectures gfx906, run the following command:
+On top of a baseline command, try individually:
 
-```bash
-docker build \
-  -t opensplat:ubuntu-22.04-cuda-12.1.1-libtorch-2.2.1-rocm-5.7.1-llvm-16 \
-  --build-arg UBUNTU_VERSION=22.04 \
-  --build-arg CUDA_VERSION=12.1.1 \
-  --build-arg TORCH_VERSION=2.2.1 \
-  --build-arg ROCM_VERSION=5.7.1 \
-  --build-arg PYTORCH_ROCM_ARCH="gfx906" \
-  --build-arg CMAKE_BUILD_TYPE=Release .
-```
-Note: If you want to use ROCm 6.x, you need to switch to AMD version of pytorch docker as a base layer to build:
-```bash
-docker build \
-  -t opensplat:ubuntu-22.04-libtorch-2.1.2-rocm-6.0.2 \
-  -f Dockerfile.rocm6 .
-```
+- Increase `--densify-grad-thresh` (fewer spurious Gaussians in the background)
+- Increase `--reset-alpha-every` (less frequent opacity resets that can “revive” artifacts)
+- Decrease `--split-screen-size` (suppress oversized splats)
 
-## Run
+Tune values empirically for your data and VRAM.
 
-To get started, download a dataset and extract it to a folder: [ [banana](https://drive.google.com/file/d/1mUUZFDo2swd6CE5vwPPkjN63Hyf4XyEv/view?usp=sharing) ]  [ [truck](https://drive.google.com/file/d/1WWXo-GKo6d-yf-K1T1CswIdkdZrBNZ_e/view?usp=sharing) ] 
+### 9.6 Viewing and Post-Processing
 
-Then run from a command line prompt:
+Use a common Splat viewer or editor for `splat.ply` (per course or toolchain).
 
-### Windows
+---
 
-```bash
-cd c:\path\to\opensplat
-opensplat.exe c:\path\to\banana -n 2000
-```
+## 10. Pipeline E (Optional): COLMAP Dense Reconstruction
 
-### macOS / Linux
+For a dense `.ply`, continue from `images/` and a chosen `sparse/`: `image_undistorter` → `patch_match_stereo` → `stereo_fusion`.  
+This is slow and disk-heavy; **OpenSplat does not require it**. See the [COLMAP documentation](https://colmap.github.io/).
 
-```bash
-cd build
-./opensplat /path/to/banana -n 2000
-```
+---
 
-The program will generate an output `splat.ply` file which can then be dragged and dropped in one of the many [viewers](https://github.com/MrNeRF/awesome-3D-gaussian-splatting?tab=readme-ov-file#viewers) such as  https://playcanvas.com/viewer. You can also edit/cleanup the scene using https://playcanvas.com/supersplat/editor. The program will also output a `cameras.json` file in the same directory which can be used by some viewers.
+## 11. Troubleshooting Summary
 
-To run on your own data, choose the path to an existing [COLMAP](https://colmap.github.io/), [OpenSfM](https://github.com/mapillary/OpenSfM), [ODM](https://github.com/OpenDroneMap/ODM) or [nerfstudio](https://docs.nerf.studio/quickstart/custom_dataset.html) project. The project must have sparse points included (random initialization is not supported, see https://github.com/pierotofy/OpenSplat/issues/7).
+| Symptom | What to try |
+|---------|-------------|
+| Process `Killed` | OOM: increase WSL memory (`.wslconfig` + `wsl --shutdown`), lower `Mapper.num_threads`, or use `hierarchical_mapper` |
+| Qt / xcb / display | `env -u DISPLAY QT_QPA_PLATFORM=offscreen`; for matching, `SiftMatching.use_gpu 0` |
+| Many `Could not register` | Small baseline / weak texture: increase sequence overlap, relax `abs_pose_*`, or hierarchical / prior workflows |
+| Docker has no GPU | Enable Docker Desktop WSL integration + GPU; or install `nvidia-container-toolkit` |
+| GPU OOM | Increase `-d` (e.g. 2→4), reduce iterations or adjust other params |
+| Missing images / `Cannot read` | Match `images` path and COLMAP records; same extensions; `--colmap-image-path` if needed |
+| CUDA illegal memory access, etc. | Lower `-d` to test stability; check image channels/decoding; use `CUDA_LAUNCH_BLOCKING=1` for debugging (see PyTorch/CUDA docs) |
 
-There's several parameters you can tune. To view the full list:
+---
 
+## 12. End-to-End Summary
 
-```bash
-./opensplat --help
-```
+1. Prepare `images/`; create and fill `database.db` if needed (feature extraction).
+2. Feature matching (e.g. `sequential_matcher` for sequences).
+3. Run `mapper` → `sparse/<id>/`; use `model_analyzer` to choose the primary model.
+4. If the camera model is incompatible with OpenSplat: undistort to PINHOLE + new images, with matching `sparse`.
+5. (Optional) Compress images without changing resolution or filenames.
+6. `docker build` OpenSplat, `docker run --gpus all`, mount the project, run `./opensplat`.
+7. Collect `splat.ply`, `cameras.json`, and optional validation render directory from the output location.
 
-### Google Colab
+---
 
-To run OpenSplat in Google Colab follow this [example notebook](https://colab.research.google.com/drive/1USqQsIBcqdOP6Fy0aVAyoXzTdpaEoTL_).
+## 13. References
 
-### Compression
+- OpenSplat: https://github.com/pierotofy/OpenSplat  
+- COLMAP: https://colmap.github.io/  
+- Project notes repo (if applicable): https://github.com/XitingChen-Chloe/opensplatting  
 
-To generate compressed splats (.splat files), use the `-o` option:
+---
 
-```bash
-./opensplat /path/to/banana -o banana.splat
-```
-
-### Resume
-
-You can resume training of a .PLY file by using the `--resume` option:
-
-```bash
-./opensplat /path/to/banana --resume ./splat.ply
-```
-
-### AMD GPU Notes
-
-To train a model with AMD GPU using docker container, you can use the following command as a reference:
-1. Launch the docker container with the following command:
-```bash
-docker run -it -v ~/data:/data --device=/dev/kfd --device=/dev/dri opensplat:ubuntu-22.04-libtorch-2.1.2-rocm-6.0.2 bash
-```
-2. Inside the docker container, run the following command to train the model:
-```bash
-export HIP_VISIBLE_DEVICES=0
-export HSA_OVERRIDE_GFX_VERSION=10.3.0  # AMD RX 6700 XT workaround 
-cd /code/build
-./opensplat /data/banana -n 2000
-```
-## Project Goals
-
-We recently released OpenSplat, so there's lots of work to do.
-
- * Support for running on AMD cards (more testing needed)
- * Improve speed / reduce memory usage
- * Distributed computation using multiple machines
- * Real-time training viewer output
- * Automatic filtering
- * Your ideas?
-
- https://github.com/pierotofy/OpenSplat/issues?q=is%3Aopen+is%3Aissue+label%3Aenhancement
-
-## Contributing
-
-We welcome contributions! Pull requests are welcome.
-
-## GPU Memory Notes
-
-A single gaussian takes ~2000 bytes of memory, so currenly you need ~2GB of GPU memory for each million gaussians.
-
-## Credits
-
-The methods used in OpenSplat are originally based on [splatfacto](https://docs.nerf.studio/nerfology/methods/splat.html).
-
-## License
-
-The code in this repository, unless otherwise noted, is licensed under the AGPLv3.
-
-The code from [splatfacto](https://docs.nerf.studio/nerfology/methods/splat.html) is originally licensed under the Apache 2.0 license and is © 2023 The Nerfstudio Team.
-
+*English version: `colmap_ws/OPEN_SPLATTING_REPORT_EN.md`. Chinese version: `colmap_ws/OPEN_SPLATTING_REPORT.md`. Replace local paths and usernames with your environment.*
