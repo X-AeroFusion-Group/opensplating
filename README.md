@@ -310,7 +310,7 @@ This is slow and disk-heavy; **OpenSplat does not require it**. See the [COLMAP 
 
 - OpenSplat: https://github.com/pierotofy/OpenSplat  
 - COLMAP: https://colmap.github.io/  
-- Project notes repo (if applicable): https://github.com/XitingChen-Chloe/opensplatting  
+- Project notes repo : https://github.com/XitingChen-Chloe/opensplatting  
 
 ---
 
