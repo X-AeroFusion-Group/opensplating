@@ -1,5 +1,7 @@
 # OpenSplatting Technical Report: From COLMAP Sparse Reconstruction to OpenSplat Training
 
+https://github.com/XitingChen-Chloe/opensplatting
+
 This document summarizes the project workflow ([opensplatting](https://github.com/XitingChen-Chloe/opensplatting)–related notes) and covers the end-to-end pipeline on **WSL2**: **COLMAP → (optional) undistortion / image compression → OpenSplat (Docker + CUDA)**.
 
 ---
